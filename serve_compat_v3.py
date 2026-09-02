@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """Local Company compatibility server v3.
 
-An outer FastAPI router intercepts UI message sends *before* the original
-backend's Pydantic validation, converts the Grok-style payload to the exact body
-shape of the real message endpoint, and forwards it internally to the original
-app. All other routes fall through unchanged.
+An outer FastAPI router intercepts UI message sends before the original backend,
+and exposes exact runtime diagnostics for the original message handler.
 """
 from __future__ import annotations
 
 import enum
+import inspect
 import os
 from typing import Any, get_args, get_origin
 
 import httpx
-import ollama_compat  # noqa: F401 - install native Ollama fallback before core import
+import ollama_compat  # noqa: F401
 import serve_compat
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -185,13 +184,7 @@ def _descriptor() -> dict[str, Any]:
     if len(body_params) == 1:
         param = body_params[0]
         annotation = getattr(param, "type_", None) or getattr(param, "annotation", None) or getattr(getattr(param, "field_info", None), "annotation", None)
-        return {
-            "route": route,
-            "kind": "scalar",
-            "fields": {},
-            "body_param": getattr(param, "name", None),
-            "annotation": annotation,
-        }
+        return {"route": route, "kind": "scalar", "fields": {}, "body_param": getattr(param, "name", None), "annotation": annotation}
 
     return {"route": route, "kind": "unknown", "fields": {}, "body_param": None, "annotation": None}
 
@@ -257,9 +250,6 @@ def _normalize(payload: Any, agent_id: str) -> tuple[Any, dict[str, Any]]:
 
 async def _forward(agent_id: str, payload: Any) -> Response:
     normalized, debug = _normalize(payload, agent_id)
-    if debug.get("unresolved_required"):
-        return JSONResponse(status_code=422, content={"detail": "Compatibility router could not satisfy backend message schema", "adapter": debug})
-
     transport = httpx.ASGITransport(app=core_app, raise_app_exceptions=False)
     async with httpx.AsyncClient(transport=transport, base_url="http://local-company-core") as client:
         core_response = await client.post(f"/api/agents/{agent_id}/messages", json=normalized)
@@ -298,15 +288,22 @@ async def send_generic_message(request: Request):
         payload = {}
     agent_id = _extract_agent_id(payload)
     if not agent_id:
-        return JSONResponse(
-            status_code=422,
-            content={
-                "detail": "Message destination missing",
-                "received_keys": list(payload.keys()) if isinstance(payload, dict) else [],
-                "accepted_destination_keys": list(_AGENT_KEYS),
-            },
-        )
+        return JSONResponse(status_code=422, content={"detail": "Message destination missing"})
     return await _forward(agent_id, payload)
+
+
+def _param_dump(items: list[Any]) -> list[dict[str, Any]]:
+    out = []
+    for p in items or []:
+        out.append({
+            "name": getattr(p, "name", None),
+            "alias": getattr(p, "alias", None),
+            "required": bool(getattr(p, "required", False)),
+            "type": str(getattr(p, "type_", None)),
+            "annotation": str(getattr(p, "annotation", None) or getattr(getattr(p, "field_info", None), "annotation", None)),
+            "default": repr(getattr(p, "default", None)),
+        })
+    return out
 
 
 @app.get("/api/compat/message-schema", include_in_schema=False)
@@ -323,20 +320,53 @@ def message_schema():
     }
 
 
-# Must be last: unmatched requests continue into the authoritative backend.
+@app.get("/api/compat/message-debug", include_in_schema=False)
+def message_debug():
+    route = _real_message_route()
+    if route is None:
+        return {"ok": False, "error": "route not found"}
+    endpoint = route.endpoint
+    try:
+        source = inspect.getsource(endpoint)
+    except Exception as exc:
+        source = f"<source unavailable: {exc}>"
+    dep = route.dependant
+    dependencies = []
+    for child in getattr(dep, "dependencies", []) or []:
+        call = getattr(child, "call", None)
+        try:
+            sig = str(inspect.signature(call)) if call else None
+        except Exception:
+            sig = None
+        dependencies.append({
+            "name": getattr(child, "name", None),
+            "call": getattr(call, "__qualname__", repr(call)),
+            "module": getattr(call, "__module__", None),
+            "signature": sig,
+        })
+    return {
+        "ok": True,
+        "path": route.path,
+        "methods": sorted(route.methods or []),
+        "endpoint": getattr(endpoint, "__qualname__", repr(endpoint)),
+        "module": getattr(endpoint, "__module__", None),
+        "signature": str(inspect.signature(endpoint)),
+        "source": source,
+        "path_params": _param_dump(getattr(dep, "path_params", []) or []),
+        "query_params": _param_dump(getattr(dep, "query_params", []) or []),
+        "body_params": _param_dump(getattr(dep, "body_params", []) or []),
+        "header_params": _param_dump(getattr(dep, "header_params", []) or []),
+        "cookie_params": _param_dump(getattr(dep, "cookie_params", []) or []),
+        "dependencies": dependencies,
+    }
+
+
 app.mount("/", core_app)
 
 
 def main() -> None:
     import uvicorn
-    uvicorn.run(
-        app,
-        host="127.0.0.1",
-        port=int(os.environ.get("LOCAL_COMPANY_BACKEND_PORT", "8000")),
-        reload=False,
-        workers=1,
-        log_level="info",
-    )
+    uvicorn.run(app, host="127.0.0.1", port=int(os.environ.get("LOCAL_COMPANY_BACKEND_PORT", "8000")), reload=False, workers=1, log_level="info")
 
 
 if __name__ == "__main__":
