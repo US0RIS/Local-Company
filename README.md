@@ -2,6 +2,20 @@
 
 A persistent, fully local AI company built around one shared Ollama model (`qwen3:8b` by default). The app provides stable AI employees in an editable management hierarchy, DMs and company/department/project channels, persisted goals/projects/tasks/meetings/memory, real manager delegation, bounded autonomous work, local filesystem/terminal/Git/Playwright tools, permission approvals, and a full audit/model-call trail.
 
+Employees are instructed to communicate like actual coworkers rather than task-system bots: concise first-person workplace language, role-specific voice, natural uncertainty, and no useless acknowledgement chatter. Observable model/action cards are presented as concise **Thoughts** summaries: the important consideration, decision/tradeoff, and next move. Raw hidden chain-of-thought is not displayed.
+
+## Qwen thinking modes
+
+Local Company uses Qwen3's hybrid thinking support to avoid paying the latency cost of deep reasoning on every routine action.
+
+- **CEO:** always runs in **DEEP** mode (`/think`).
+- **Managers:** every delegated child task must explicitly choose **DEEP** or **FAST** and state why.
+- **DEEP (`/think`):** architecture, ambiguous debugging, research synthesis, QA judgment, reviews, planning, consequential tradeoffs.
+- **FAST (`/no_think`):** deterministic execution such as running a chosen command, reading a known file, applying a precise edit, collecting a metric, or executing an established test.
+- Individual contributors default to FAST unless the delegated task explicitly requires DEEP reasoning.
+
+The runtime maintains a persistent `task_thinking_policies` index (`DEEP`, `FAST`, `AUTO`) derived from the actual task instructions so debugging/UI tooling can show whether a worker was expected to think.
+
 ## Run on your Mac
 
 Prerequisites:
@@ -16,6 +30,13 @@ Then:
 ```bash
 git clone https://github.com/US0RIS/Local-Company.git
 cd Local-Company
+./start.sh
+```
+
+If you already cloned it:
+
+```bash
+git pull origin main
 ./start.sh
 ```
 
@@ -40,7 +61,7 @@ Runtime state is stored under `runtime/` and is not deleted on restart.
 
 ## Validation
 
-The bundled source was validated before publication with:
+The original bundled source was validated before publication with:
 
 ```text
 Python compileall             PASS
