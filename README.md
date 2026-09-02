@@ -21,6 +21,8 @@ cd Local-Company
 
 Open **http://127.0.0.1:5173**.
 
+Live organization/activity visualization: **http://127.0.0.1:5173/activity-map.html**. It shows hierarchy ranks, manager/subordinate edges, task-assignment overlays, active/queued work, elapsed time, observable structured model actions/normal outputs, delegated work, and the next expected task for each employee. It intentionally does not expose hidden chain-of-thought.
+
 On a fresh clone, `start.sh` first reconstructs the validated application source from the repository's checksum-verified bootstrap bundle. It then creates `.venv`, installs backend/frontend dependencies, seeds the persistent default company, checks the existing Ollama installation, installs Playwright Chromium if necessary, and starts FastAPI and Vite.
 
 **It never downloads an AI model or silently falls back to a cloud model.** If Ollama or `qwen3:8b` is unavailable, the UI still starts and reports setup status; use the **Test Model** control after fixing Ollama.
