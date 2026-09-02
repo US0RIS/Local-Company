@@ -1,38 +1,56 @@
 #!/usr/bin/env python3
-"""Local Company backend launcher.
-
-This module is intentionally imported before app.main so SQLite engines created by
-SQLAlchemy/SQLModel get safe local-concurrency defaults.  The application has one
-physical inference worker but several logical/background jobs, so API reads and
-background writes can overlap.
-"""
+"""Local Company backend/seed launcher with SQLite concurrency safeguards."""
 from __future__ import annotations
 
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 BACKEND = ROOT / "backend"
 sys.path.insert(0, str(BACKEND))
 
-# Configure the existing database before SQLAlchemy opens pooled connections.
-# WAL is persistent in the database file and permits readers while a writer is active.
-db_path = ROOT / "runtime" / "company.db"
-if db_path.exists():
-    conn = sqlite3.connect(db_path, timeout=60.0)
-    try:
-        conn.execute("PRAGMA busy_timeout=60000")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA wal_autocheckpoint=1000")
-        conn.commit()
-    finally:
-        conn.close()
 
-# Patch engine construction before importing Local Company's app modules.  This
-# covers both `from sqlalchemy import create_engine` and SQLModel's re-export.
+def _configure_existing_database() -> None:
+    """Enable WAL before SQLAlchemy opens its connection pool.
+
+    WAL lets API readers coexist with the single logical writer much more safely.
+    The retry is deliberately bounded: a genuinely live foreign process should
+    not leave startup hanging forever.
+    """
+    db_path = ROOT / "runtime" / "company.db"
+    if not db_path.exists():
+        return
+
+    last_error: Exception | None = None
+    for attempt in range(6):
+        try:
+            conn = sqlite3.connect(db_path, timeout=60.0)
+            try:
+                conn.execute("PRAGMA busy_timeout=60000")
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA wal_autocheckpoint=1000")
+                conn.commit()
+                return
+            finally:
+                conn.close()
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if "locked" not in str(exc).lower() or attempt == 5:
+                raise
+            time.sleep(0.5 * (attempt + 1))
+
+    if last_error:
+        raise last_error
+
+
+_configure_existing_database()
+
+# Patch engine creation before any Local Company module imports app.db.  This
+# therefore applies to normal server startup AND the seed command below.
 import sqlalchemy  # noqa: E402
 from sqlalchemy import event  # noqa: E402
 
@@ -76,10 +94,17 @@ try:
 except Exception:
     pass
 
-import uvicorn  # noqa: E402
-from app.main import app  # noqa: E402
 
-if __name__ == "__main__":
+def _seed() -> None:
+    from app.cli import seed
+
+    seed()
+
+
+def _serve() -> None:
+    import uvicorn
+    from app.main import app
+
     uvicorn.run(
         app,
         host="127.0.0.1",
@@ -88,3 +113,10 @@ if __name__ == "__main__":
         workers=1,
         log_level="info",
     )
+
+
+if __name__ == "__main__":
+    if "--seed" in sys.argv[1:]:
+        _seed()
+    else:
+        _serve()
