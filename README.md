@@ -16,7 +16,40 @@ Local Company uses Qwen3's hybrid thinking support to avoid paying the latency c
 
 The runtime maintains a persistent `task_thinking_policies` index (`DEEP`, `FAST`, `AUTO`) derived from the actual task instructions so debugging/UI tooling can show whether a worker was expected to think.
 
-## Run on your Mac
+## Run on Windows
+
+Prerequisites:
+
+- Windows 10/11
+- Git
+- Python 3.12+
+- Node.js 20+ / npm
+- Ollama for Windows, running locally
+- `qwen3:8b` already installed (check with `ollama list`)
+
+From Windows Terminal, PowerShell, or Command Prompt:
+
+```powershell
+git clone https://github.com/US0RIS/Local-Company.git
+cd Local-Company
+.\start.cmd
+```
+
+If you already cloned it:
+
+```powershell
+cd Local-Company
+git pull origin main
+.\start.cmd
+```
+
+`start.cmd` invokes the native `start.ps1` launcher with a local execution-policy bypass, so you do not need to change your machine-wide PowerShell policy. It automatically finds Python 3.12+, reconstructs the source bundle on a fresh clone, creates `.venv`, installs Python/npm dependencies, checks Ollama and `qwen3:8b`, installs Playwright Chromium if necessary, initializes the persistent database, stops stale Local Company Python/Node workers, and starts FastAPI plus Vite.
+
+Open **http://127.0.0.1:5173**.
+
+Live organization/activity visualization: **http://127.0.0.1:5173/activity-map.html**.
+
+## Run on macOS
 
 Prerequisites:
 
@@ -44,7 +77,7 @@ Open **http://127.0.0.1:5173**.
 
 Live organization/activity visualization: **http://127.0.0.1:5173/activity-map.html**. It shows hierarchy ranks, manager/subordinate edges, task-assignment overlays, active/queued work, elapsed time, observable structured model actions/normal outputs, delegated work, and the next expected task for each employee. It intentionally does not expose hidden chain-of-thought.
 
-On a fresh clone, `start.sh` first reconstructs the validated application source from the repository's checksum-verified bootstrap bundle. It then creates `.venv`, installs backend/frontend dependencies, seeds the persistent default company, checks the existing Ollama installation, installs Playwright Chromium if necessary, and starts FastAPI and Vite.
+On a fresh clone, the platform launcher first reconstructs the validated application source from the repository's checksum-verified bootstrap bundle. It then creates `.venv`, installs backend/frontend dependencies, seeds the persistent default company, checks the existing Ollama installation, installs Playwright Chromium if necessary, and starts FastAPI and Vite.
 
 **It never downloads an AI model or silently falls back to a cloud model.** If Ollama or `qwen3:8b` is unavailable, the UI still starts and reports setup status; use the **Test Model** control after fixing Ollama.
 
@@ -70,6 +103,6 @@ TypeScript source transpile   PASS
 Bootstrap checksum/extract    PASS
 ```
 
-The remaining checks necessarily run on the target Mac: real `qwen3:8b` inference, npm production build with downloaded packages, Playwright browser launch, and the real-model end-to-end acceptance workflows.
+The remaining checks necessarily run on the target machine: real `qwen3:8b` inference, npm production build with downloaded packages, Playwright browser launch, and the real-model end-to-end acceptance workflows.
 
 After the first launch, the full source tree is present locally, including `backend/`, `frontend/`, `docs/`, Alembic migrations, tests, `PROJECT_STATUS.md`, and `.env.example`.
