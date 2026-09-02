@@ -6,18 +6,54 @@ cd "$ROOT"
 
 EXPECTED_BUNDLE_SHA256="be4b46495a0a44380770ae694769ed584073088b3fbf0399616c93f4800e01e9"
 
+find_python() {
+  local candidate
+  local candidates=()
+
+  if [[ -n "${PYTHON_BIN:-}" ]]; then
+    candidates+=("$PYTHON_BIN")
+  fi
+
+  # Prefer an explicitly versioned modern Python. This matters on macOS, where
+  # /usr/bin/python3 may still be Apple's older system Python even after a
+  # newer Homebrew Python has been installed.
+  candidates+=(python3.14 python3.13 python3.12 python3)
+  candidates+=(/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12)
+  candidates+=(/usr/local/bin/python3.14 /usr/local/bin/python3.13 /usr/local/bin/python3.12)
+
+  for candidate in "${candidates[@]}"; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      if "$candidate" - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 12) else 1)
+PY
+      then
+        command -v "$candidate"
+        return 0
+      fi
+    fi
+  done
+
+  return 1
+}
+
+PYTHON_EXECUTABLE="$(find_python || true)"
+if [[ -z "$PYTHON_EXECUTABLE" ]]; then
+  echo "Python 3.12+ is required, but no compatible interpreter was found." >&2
+  echo "On Homebrew macOS, install it with: brew install python@3.12" >&2
+  echo "Then run ./start.sh again." >&2
+  exit 1
+fi
+
+echo "✓ Using $($PYTHON_EXECUTABLE --version 2>&1) at $PYTHON_EXECUTABLE"
+
 bootstrap_source() {
   if [[ -f backend/app/main.py && -f frontend/package.json ]]; then
     return
   fi
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "Python 3.12+ is required. Install it, then run ./start.sh again." >&2
-    exit 1
-  fi
-
   echo "Preparing Local Company source from the repository bootstrap bundle..."
-  python3 - "$ROOT" "$EXPECTED_BUNDLE_SHA256" <<'PY'
+  "$PYTHON_EXECUTABLE" - "$ROOT" "$EXPECTED_BUNDLE_SHA256" <<'PY'
 import base64
 import hashlib
 import io
@@ -62,16 +98,6 @@ PY
 
 bootstrap_source
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "Python 3.12+ is required." >&2
-  exit 1
-fi
-python3 - <<'PY'
-import sys
-if sys.version_info < (3, 12):
-    raise SystemExit(f"Python 3.12+ is required; found {sys.version.split()[0]}")
-PY
-
 if ! command -v npm >/dev/null 2>&1; then
   echo "Node.js/npm is required for the React UI. Install Node.js 20+ and run ./start.sh again." >&2
   exit 1
@@ -89,8 +115,20 @@ export OLLAMA_HOST="${OLLAMA_HOST:-http://127.0.0.1:11434}"
 export OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3:8b}"
 
 if [[ ! -d .venv ]]; then
-  python3 -m venv .venv
+  "$PYTHON_EXECUTABLE" -m venv .venv
 fi
+
+# Refuse a stale incompatible virtual environment rather than deleting it.
+if ! .venv/bin/python - <<'PY' >/dev/null 2>&1
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 12) else 1)
+PY
+then
+  echo "The existing .venv uses Python older than 3.12." >&2
+  echo "Remove it manually with 'rm -rf .venv' and run ./start.sh again." >&2
+  exit 1
+fi
+
 # shellcheck disable=SC1091
 source .venv/bin/activate
 python -m pip install --quiet --upgrade pip
