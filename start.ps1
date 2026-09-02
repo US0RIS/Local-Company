@@ -193,14 +193,14 @@ function Stop-StaleLocalCompanyProcesses {
             Where-Object {
                 $_.ProcessId -ne $PID -and $_.CommandLine -and
                 ($_.CommandLine -match $rootEscaped) -and
-                ($_.Name -match '^(python|pythonw|node|npm|cmd|powershell|pwsh)(\.exe)?$')
+                ($_.Name -match '^(python|pythonw|node)(\.exe)?$')
             } |
             ForEach-Object {
-                Write-Host "Stopping stale Local Company process $($_.ProcessId)..."
+                Write-Host "Stopping stale Local Company worker $($_.ProcessId)..."
                 Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
             }
     } catch {
-        Write-Host '! Could not inspect stale processes; continuing.' -ForegroundColor Yellow
+        Write-Host '! Could not inspect stale workers; continuing.' -ForegroundColor Yellow
     }
     Start-Sleep -Milliseconds 600
 }
