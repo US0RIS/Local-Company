@@ -78,10 +78,22 @@ def run(cmd: list[str], *, cwd: Path | None = None, check: bool = True, quiet: b
     return proc
 
 
-def cmdline_for_batch(batch: str, args: list[str]) -> list[str]:
+def npm_command(npm: str, node: str, args: list[str]) -> list[str]:
+    """Invoke npm without relying on Windows batch-file quoting.
+
+    The standard npm.cmd wrapper lives next to node.exe and dispatches to
+    node_modules/npm/bin/npm-cli.js. Calling that JS entry point directly avoids
+    cmd.exe's special quoting rules for paths such as C:\\Program Files\\nodejs.
+    """
+    npm_cli = Path(npm).resolve().parent / "node_modules" / "npm" / "bin" / "npm-cli.js"
+    if npm_cli.is_file():
+        return [node, str(npm_cli), *args]
+
+    # Fallback for unusual Node installations where npm-cli.js is elsewhere.
+    # CALL makes a quoted .cmd path parse correctly under cmd.exe.
     comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
-    command = subprocess.list2cmdline([batch, *args])
-    return [comspec, "/d", "/s", "/c", command]
+    quoted = subprocess.list2cmdline([npm, *args])
+    return [comspec, "/d", "/c", "call " + quoted]
 
 
 def load_dotenv() -> None:
@@ -158,7 +170,7 @@ def main() -> int:
     os.chdir(ROOT)
     total = 8
 
-    print(f"Local Company Windows launcher", flush=True)
+    print("Local Company Windows launcher", flush=True)
     print(f"Using Python {sys.version.split()[0]} at {sys.executable}", flush=True)
 
     if sys.version_info < (3, 12):
@@ -194,6 +206,11 @@ def main() -> int:
     if major < 20:
         return fail(f"Node.js 20+ is required; found {node_version}.")
 
+    npm_probe = run(npm_command(npm, node, ["--version"]), check=False, quiet=True)
+    if npm_probe.returncode != 0:
+        return fail("Node was found, but npm could not be executed. Reinstall Node.js LTS and run start.cmd again.")
+    print(f"npm {npm_probe.stdout.strip()}", flush=True)
+
     load_dotenv()
     os.environ["LOCAL_COMPANY_ROOT"] = str(ROOT)
     os.environ.setdefault("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -218,7 +235,7 @@ def main() -> int:
         run([str(VENV_PYTHON), "-m", "pip", "install", "--disable-pip-version-check", "-e", "./backend[dev]"])
         if not (FRONTEND / "node_modules").is_dir():
             print("Installing frontend npm packages...", flush=True)
-            run(cmdline_for_batch(npm, ["install", "--no-audit", "--no-fund"]), cwd=FRONTEND)
+            run(npm_command(npm, node, ["install", "--no-audit", "--no-fund"]), cwd=FRONTEND)
     except subprocess.CalledProcessError as exc:
         return fail(f"Dependency installation failed (exit code {exc.returncode}).")
 
@@ -282,8 +299,9 @@ def main() -> int:
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
         frontend = subprocess.Popen(
-            cmdline_for_batch(
+            npm_command(
                 npm,
+                node,
                 ["run", "dev", "--", "--host", "127.0.0.1", "--port", str(FRONTEND_PORT), "--strictPort"],
             ),
             cwd=str(FRONTEND),
