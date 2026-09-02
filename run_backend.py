@@ -2,19 +2,20 @@
 """Local Company backend/seed launcher with SQLite concurrency safeguards.
 
 The application intentionally uses SQLite for V1, but the agent runtime can keep
-many logical jobs alive while a single model call is in flight.  A conventional
+many logical jobs alive while a single model call is in flight. A conventional
 SQLAlchemy Session can therefore hold SQLite's single writer transaction open
-while Python awaits inference or another agent.  WAL and a busy timeout alone do
+while Python awaits inference or another agent. WAL and a busy timeout alone do
 not fix that pattern.
 
 This launcher configures WAL once before SQLAlchemy starts, uses short-lived
 connections, and runs SQLite in DBAPI autocommit mode so individual statements
-release the writer lock immediately.  This is a pragmatic V1 tradeoff: persisted
-state is still durable, while multi-statement ORM operations are not treated as
-one database-wide atomic transaction.
+release the writer lock immediately. It also installs the current local UI shell
+into the Vite frontend before startup so existing clones receive UI updates on
+`git pull` without rebuilding the original bootstrap archive.
 """
 from __future__ import annotations
 
+import gzip
 import os
 import sqlite3
 import sys
@@ -24,6 +25,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 BACKEND = ROOT / "backend"
 sys.path.insert(0, str(BACKEND))
+
+
+def _install_ui() -> None:
+    source = ROOT / "ui" / "grok-shell.html.gz"
+    target = ROOT / "frontend" / "index.html"
+    if not source.exists() or not target.parent.exists():
+        return
+    data = gzip.decompress(source.read_bytes())
+    if not data.lstrip().startswith(b"<!doctype html>"):
+        raise RuntimeError("Local Company UI bundle is invalid")
+    if not target.exists() or target.read_bytes() != data:
+        target.write_bytes(data)
+        print("✓ Installed streamlined Local Company UI")
 
 
 def _configure_database() -> None:
@@ -56,9 +70,10 @@ def _configure_database() -> None:
         raise last_error
 
 
+_install_ui()
 _configure_database()
 
-# Patch engine creation before any Local Company module imports app.db.  This
+# Patch engine creation before any Local Company module imports app.db. This
 # applies to normal server startup and to the seed command below.
 import sqlalchemy  # noqa: E402
 from sqlalchemy import event  # noqa: E402
@@ -116,7 +131,6 @@ except Exception:
 
 def _seed() -> None:
     from app.cli import seed
-
     seed()
 
 
