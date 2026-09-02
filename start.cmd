@@ -21,22 +21,22 @@ exit /b 1
 
 :PY312
 echo Starting Local Company with Python 3.12...
-py.exe -3.12 "%~dp0start_windows.py"
+py.exe -3.12 "%~dp0start_windows_entry.py"
 goto DONE
 
 :PY313
 echo Starting Local Company with Python 3.13...
-py.exe -3.13 "%~dp0start_windows.py"
+py.exe -3.13 "%~dp0start_windows_entry.py"
 goto DONE
 
 :PY314
 echo Starting Local Company with Python 3.14...
-py.exe -3.14 "%~dp0start_windows.py"
+py.exe -3.14 "%~dp0start_windows_entry.py"
 goto DONE
 
 :PYTHON
 echo Starting Local Company with python.exe...
-python.exe "%~dp0start_windows.py"
+python.exe "%~dp0start_windows_entry.py"
 
 :DONE
 set EXITCODE=%ERRORLEVEL%
