@@ -14,9 +14,8 @@ find_python() {
     candidates+=("$PYTHON_BIN")
   fi
 
-  # Prefer an explicitly versioned modern Python. This matters on macOS, where
-  # /usr/bin/python3 may still be Apple's older system Python even after a
-  # newer Homebrew Python has been installed.
+  # Prefer an explicitly versioned modern Python. macOS can keep Apple's old
+  # /usr/bin/python3 first in PATH even after Homebrew Python is installed.
   candidates+=(python3.14 python3.13 python3.12 python3)
   candidates+=(/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12)
   candidates+=(/usr/local/bin/python3.14 /usr/local/bin/python3.13 /usr/local/bin/python3.12)
@@ -33,7 +32,6 @@ PY
       fi
     fi
   done
-
   return 1
 }
 
@@ -41,7 +39,6 @@ PYTHON_EXECUTABLE="$(find_python || true)"
 if [[ -z "$PYTHON_EXECUTABLE" ]]; then
   echo "Python 3.12+ is required, but no compatible interpreter was found." >&2
   echo "On Homebrew macOS, install it with: brew install python@3.12" >&2
-  echo "Then run ./start.sh again." >&2
   exit 1
 fi
 
@@ -66,32 +63,23 @@ expected = sys.argv[2]
 parts = sorted((root / "bootstrap").glob("bundle.part.*"))
 if not parts:
     raise SystemExit("Bootstrap bundle is missing. Re-clone US0RIS/Local-Company and try again.")
-
 payload = b"".join(part.read_bytes().strip() for part in parts)
-try:
-    archive = base64.b64decode(payload, validate=True)
-except Exception as exc:
-    raise SystemExit(f"Bootstrap bundle is corrupt: {exc}") from exc
-
+archive = base64.b64decode(payload, validate=True)
 actual = hashlib.sha256(archive).hexdigest()
 if actual != expected:
     raise SystemExit(
-        f"Bootstrap checksum mismatch. Expected {expected}, got {actual}. "
-        "Re-clone the repository rather than running unverified source."
+        f"Bootstrap checksum mismatch. Expected {expected}, got {actual}. Re-clone the repository."
     )
-
 with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as tf:
     for member in tf.getmembers():
         target = (root / member.name).resolve()
         if target != root and root not in target.parents:
             raise SystemExit(f"Unsafe path in bootstrap archive: {member.name}")
     tf.extractall(root)
-
 required = [root / "backend/app/main.py", root / "frontend/package.json", root / "docs/ARCHITECTURE.md"]
 missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
 if missing:
     raise SystemExit("Bootstrap completed incompletely; missing: " + ", ".join(missing))
-
 print("Source ready.")
 PY
 }
@@ -117,8 +105,6 @@ export OLLAMA_MODEL="${OLLAMA_MODEL:-qwen3:8b}"
 if [[ ! -d .venv ]]; then
   "$PYTHON_EXECUTABLE" -m venv .venv
 fi
-
-# Refuse a stale incompatible virtual environment rather than deleting it.
 if ! .venv/bin/python - <<'PY' >/dev/null 2>&1
 import sys
 raise SystemExit(0 if sys.version_info >= (3, 12) else 1)
@@ -144,16 +130,46 @@ if command -v ollama >/dev/null 2>&1; then
   else
     echo "! Ollama is installed, but $OLLAMA_MODEL was not found."
     echo "  Local Company will still start; Test Model will show setup status."
-    echo "  Verify the installed models with: ollama list"
+    echo "  Verify installed models with: ollama list"
     echo "  No model will be downloaded automatically."
   fi
 else
   echo "! The ollama command is not available."
   echo "  Local Company will still start so setup status is visible in the UI."
-  echo "  Install/start Ollama and verify qwen3:8b with: ollama list"
 fi
 
-python -m app.cli seed
+# Earlier development versions used uvicorn --reload. On macOS its spawned child
+# can outlive the parent and keep company.db locked after Ctrl-C. Stop ONLY stale
+# processes whose working directory belongs to this Local-Company checkout.
+stop_stale_local_company_processes() {
+  if ! command -v lsof >/dev/null 2>&1; then
+    return
+  fi
+
+  local candidates=""
+  if [[ -f "$ROOT/runtime/company.db" ]]; then
+    candidates="$candidates $(lsof -t "$ROOT/runtime/company.db" 2>/dev/null || true)"
+  fi
+  candidates="$candidates $(lsof -tiTCP:8000 -sTCP:LISTEN 2>/dev/null || true)"
+  candidates="$candidates $(lsof -tiTCP:5173 -sTCP:LISTEN 2>/dev/null || true)"
+
+  local pid cwd command
+  for pid in $(printf '%s\n' $candidates | awk 'NF' | sort -u); do
+    [[ "$pid" = "$$" || "$pid" = "$PPID" ]] && continue
+    cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    if [[ "$cwd" == "$ROOT" || "$cwd" == "$ROOT/"* || "$command" == *"$ROOT"* ]]; then
+      echo "Stopping stale Local Company process $pid..."
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+}
+
+stop_stale_local_company_processes
+
+# Seed through the same WAL/busy-timeout wrapper used by the live backend.
+python "$ROOT/run_backend.py" --seed
 
 # Install Playwright Chromium only if the already-installed browser cannot launch.
 python - <<'PY' >/dev/null 2>&1 || python -m playwright install chromium
@@ -168,9 +184,6 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# run_backend.py applies WAL + busy_timeout to every SQLite connection and runs
-# exactly one backend process. This prevents UI reads/background agent writes
-# from failing with `sqlite3.OperationalError: database is locked`.
 python "$ROOT/run_backend.py" &
 BACK_PID=$!
 (cd frontend && npm run dev -- --host 127.0.0.1) &
