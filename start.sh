@@ -168,7 +168,10 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-(cd backend && uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload) &
+# run_backend.py applies WAL + busy_timeout to every SQLite connection and runs
+# exactly one backend process. This prevents UI reads/background agent writes
+# from failing with `sqlite3.OperationalError: database is locked`.
+python "$ROOT/run_backend.py" &
 BACK_PID=$!
 (cd frontend && npm run dev -- --host 127.0.0.1) &
 FRONT_PID=$!
