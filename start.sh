@@ -14,8 +14,6 @@ find_python() {
     candidates+=("$PYTHON_BIN")
   fi
 
-  # Prefer an explicitly versioned modern Python. macOS can keep Apple's old
-  # /usr/bin/python3 first in PATH even after Homebrew Python is installed.
   candidates+=(python3.14 python3.13 python3.12 python3)
   candidates+=(/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12)
   candidates+=(/usr/local/bin/python3.14 /usr/local/bin/python3.13 /usr/local/bin/python3.12)
@@ -124,6 +122,11 @@ if [[ ! -d frontend/node_modules ]]; then
   (cd frontend && npm install --no-audit --no-fund)
 fi
 
+# Make the live hierarchy/activity visualization available through Vite without
+# coupling it to the React shell. It reads the same persistent backend state.
+mkdir -p frontend/public
+cp "$ROOT/activity-map.html" frontend/public/activity-map.html
+
 if command -v ollama >/dev/null 2>&1; then
   if ollama list 2>/dev/null | awk 'NR > 1 {print $1}' | grep -qx "$OLLAMA_MODEL"; then
     echo "✓ Found Ollama model $OLLAMA_MODEL"
@@ -138,9 +141,6 @@ else
   echo "  Local Company will still start so setup status is visible in the UI."
 fi
 
-# Earlier development versions used uvicorn --reload. On macOS its spawned child
-# can outlive the parent and keep company.db locked after Ctrl-C. Stop ONLY stale
-# processes whose working directory belongs to this Local-Company checkout.
 stop_stale_local_company_processes() {
   if ! command -v lsof >/dev/null 2>&1; then
     return
@@ -167,11 +167,8 @@ stop_stale_local_company_processes() {
 }
 
 stop_stale_local_company_processes
-
-# Seed through the same WAL/busy-timeout wrapper used by the live backend.
 python "$ROOT/run_backend.py" --seed
 
-# Install Playwright Chromium only if the already-installed browser cannot launch.
 python - <<'PY' >/dev/null 2>&1 || python -m playwright install chromium
 from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
@@ -191,8 +188,9 @@ FRONT_PID=$!
 
 echo
 echo "Local Company is starting:"
-echo "  UI:      http://127.0.0.1:5173"
-echo "  Backend: http://127.0.0.1:8000"
+echo "  UI:           http://127.0.0.1:5173"
+echo "  Activity map: http://127.0.0.1:5173/activity-map.html"
+echo "  Backend:      http://127.0.0.1:8000"
 echo "Press Ctrl-C to stop both servers."
 echo
 
