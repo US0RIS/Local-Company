@@ -4,6 +4,14 @@ Set-StrictMode -Version 2.0
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
 
+# Refresh PATH so software installed by winget in the current Terminal session
+# is visible without requiring the user to close and reopen Windows Terminal.
+$MachinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+$UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+if ($MachinePath -or $UserPath) {
+    $env:Path = ($MachinePath + ';' + $UserPath).Trim(';')
+}
+
 function Test-PythonCandidate {
     param([string]$Exe, [string]$LauncherArg)
     try {
@@ -57,7 +65,7 @@ if (-not $Python) {
     Write-Host 'Python 3.12 or newer is required.' -ForegroundColor Red
     Write-Host 'Install it with:'
     Write-Host '  winget install -e --id Python.Python.3.12'
-    Write-Host 'Then close and reopen Windows Terminal and run start.cmd again.'
+    Write-Host 'Then run start.cmd again.'
     exit 1
 }
 
@@ -68,14 +76,14 @@ if ($Python.Arg) {
 }
 Write-Host "Using $VersionText"
 
-$bootstrapCode = Invoke-Python $Python @((Join-Path $Root 'bootstrap_windows.py'))
+$bootstrapCode = Invoke-Python -Python $Python -Arguments @((Join-Path $Root 'bootstrap_windows.py'))
 if ($bootstrapCode -ne 0) { exit $bootstrapCode }
 
 if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
     Write-Host 'Node.js/npm is required.' -ForegroundColor Red
     Write-Host 'Install it with:'
     Write-Host '  winget install -e --id OpenJS.NodeJS.LTS'
-    Write-Host 'Then close and reopen Windows Terminal and run start.cmd again.'
+    Write-Host 'Then run start.cmd again.'
     exit 1
 }
 
@@ -107,7 +115,7 @@ if (-not $env:OLLAMA_MODEL) { $env:OLLAMA_MODEL = 'qwen3:8b' }
 $VenvPython = Join-Path $Root '.venv\Scripts\python.exe'
 if (-not (Test-Path $VenvPython)) {
     Write-Host 'Creating Python virtual environment...'
-    $venvCode = Invoke-Python $Python @('-m', 'venv', '.venv')
+    $venvCode = Invoke-Python -Python $Python -Arguments @('-m', 'venv', '.venv')
     if ($venvCode -ne 0) { exit $venvCode }
 }
 
@@ -143,9 +151,17 @@ if (Test-Path 'activity-map.html') {
     Copy-Item 'activity-map.html' 'frontend\public\activity-map.html' -Force
 }
 
-if (Get-Command ollama.exe -ErrorAction SilentlyContinue) {
+$OllamaCommand = Get-Command ollama.exe -ErrorAction SilentlyContinue
+if (-not $OllamaCommand) {
+    $OllamaDefault = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'
+    if (Test-Path $OllamaDefault) { $OllamaCommand = Get-Item $OllamaDefault }
+}
+
+if ($OllamaCommand) {
     try {
-        $models = & ollama.exe 'list' 2>$null
+        $ollamaExe = $OllamaCommand.Source
+        if (-not $ollamaExe) { $ollamaExe = $OllamaCommand.FullName }
+        $models = & $ollamaExe 'list' 2>$null
         $foundModel = $false
         foreach ($line in $models) {
             if ($line -match '^\s*([^\s]+)') {
@@ -166,7 +182,7 @@ if (Get-Command ollama.exe -ErrorAction SilentlyContinue) {
         Write-Host 'Open Ollama, then run start.cmd again.'
     }
 } else {
-    Write-Host 'Ollama is not on PATH. The UI can start, but AI work will not run.' -ForegroundColor Yellow
+    Write-Host 'Ollama is not installed or could not be found.' -ForegroundColor Yellow
 }
 
 function Stop-StaleLocalCompanyWorkers {
