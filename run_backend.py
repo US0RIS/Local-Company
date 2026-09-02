@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Local Company backend/seed launcher with SQLite concurrency safeguards."""
+"""Local Company backend/seed launcher with SQLite concurrency safeguards.
+
+The application intentionally uses SQLite for V1, but the agent runtime can keep
+many logical jobs alive while a single model call is in flight.  A conventional
+SQLAlchemy Session can therefore hold SQLite's single writer transaction open
+while Python awaits inference or another agent.  WAL and a busy timeout alone do
+not fix that pattern.
+
+This launcher configures WAL once before SQLAlchemy starts, uses short-lived
+connections, and runs SQLite in DBAPI autocommit mode so individual statements
+release the writer lock immediately.  This is a pragmatic V1 tradeoff: persisted
+state is still durable, while multi-statement ORM operations are not treated as
+one database-wide atomic transaction.
+"""
 from __future__ import annotations
 
 import os
@@ -13,46 +26,43 @@ BACKEND = ROOT / "backend"
 sys.path.insert(0, str(BACKEND))
 
 
-def _configure_existing_database() -> None:
-    """Enable WAL before SQLAlchemy opens its connection pool.
-
-    WAL lets API readers coexist with the single logical writer much more safely.
-    The retry is deliberately bounded: a genuinely live foreign process should
-    not leave startup hanging forever.
-    """
+def _configure_database() -> None:
+    """Create/configure the SQLite file before SQLAlchemy opens any connections."""
     db_path = ROOT / "runtime" / "company.db"
-    if not db_path.exists():
-        return
+    db_path.parent.mkdir(parents=True, exist_ok=True)
 
     last_error: Exception | None = None
-    for attempt in range(6):
+    for attempt in range(8):
         try:
-            conn = sqlite3.connect(db_path, timeout=60.0)
+            conn = sqlite3.connect(db_path, timeout=60.0, isolation_level=None)
             try:
                 conn.execute("PRAGMA busy_timeout=60000")
+                # journal_mode is persistent. Do it once here, never in each
+                # pooled/ORM connection where it can itself contend for a lock.
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.execute("PRAGMA wal_autocheckpoint=1000")
-                conn.commit()
+                conn.execute("PRAGMA foreign_keys=ON")
                 return
             finally:
                 conn.close()
         except sqlite3.OperationalError as exc:
             last_error = exc
-            if "locked" not in str(exc).lower() or attempt == 5:
+            if "locked" not in str(exc).lower() or attempt == 7:
                 raise
-            time.sleep(0.5 * (attempt + 1))
+            time.sleep(min(4.0, 0.5 * (attempt + 1)))
 
     if last_error:
         raise last_error
 
 
-_configure_existing_database()
+_configure_database()
 
 # Patch engine creation before any Local Company module imports app.db.  This
-# therefore applies to normal server startup AND the seed command below.
+# applies to normal server startup and to the seed command below.
 import sqlalchemy  # noqa: E402
 from sqlalchemy import event  # noqa: E402
+from sqlalchemy.pool import NullPool  # noqa: E402
 
 _real_create_engine = sqlalchemy.create_engine
 
@@ -64,6 +74,16 @@ def _local_create_engine(url, *args, **kwargs):
         connect_args.setdefault("check_same_thread", False)
         kwargs["connect_args"] = connect_args
 
+        # Do not retain a connection/session transaction across unrelated agent
+        # turns. SQLite has one writer; short-lived connections are appropriate
+        # for this local single-user workload.
+        kwargs.setdefault("poolclass", NullPool)
+
+        # Critical: SQLAlchemy Sessions may remain alive while an async agent
+        # awaits Ollama. DBAPI autocommit makes each SQL statement release the
+        # SQLite writer lock instead of holding it until that later Session.commit().
+        kwargs.setdefault("isolation_level", "AUTOCOMMIT")
+
     engine = _real_create_engine(url, *args, **kwargs)
 
     if str(url).startswith("sqlite"):
@@ -72,7 +92,6 @@ def _local_create_engine(url, *args, **kwargs):
             cursor = dbapi_connection.cursor()
             try:
                 cursor.execute("PRAGMA busy_timeout=60000")
-                cursor.execute("PRAGMA journal_mode=WAL")
                 cursor.execute("PRAGMA synchronous=NORMAL")
                 cursor.execute("PRAGMA foreign_keys=ON")
             finally:
