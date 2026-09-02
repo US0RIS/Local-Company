@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Compatibility fallback for Ollama installs without /v1/chat/completions.
 
-Local Company historically used Ollama's OpenAI-compatible endpoint. Some
-Windows Ollama installations expose the native /api/chat endpoint but return
-404 for /v1/chat/completions. This module patches httpx so a 404 from that one
-endpoint is retried through /api/chat and translated back into OpenAI-style
-JSON expected by the existing runtime.
+The original runtime uses Ollama's OpenAI-compatible endpoint. Some local Ollama
+installs expose /api/chat but return 404 for /v1/chat/completions. This patch
+recognizes both absolute and base_url-relative httpx requests, retries through
+/api/chat, and translates the native response back to the OpenAI-shaped JSON the
+runtime already expects.
 """
 from __future__ import annotations
 
 import json
 import time
-from urllib.parse import urlsplit, urlunsplit
+from typing import Any
 
 import httpx
 
@@ -20,22 +20,34 @@ _ORIG_ASYNC_REQUEST = httpx.AsyncClient.request
 _ORIG_SYNC_REQUEST = httpx.Client.request
 
 
-def _is_openai_ollama_url(url: object) -> bool:
+def _resolved_url(client: Any, url: object) -> httpx.URL | None:
     try:
-        text = str(url)
-        parts = urlsplit(text)
+        candidate = httpx.URL(str(url))
+        if candidate.is_absolute_url:
+            return candidate
+        base = getattr(client, "base_url", None)
+        if base:
+            return httpx.URL(base).join(candidate)
+        return candidate
+    except Exception:
+        return None
+
+
+def _is_openai_ollama_url(url: httpx.URL | None) -> bool:
+    if url is None:
+        return False
+    try:
         return (
-            parts.hostname in {"127.0.0.1", "localhost"}
-            and (parts.port or 80) == 11434
-            and parts.path.rstrip("/") == "/v1/chat/completions"
+            url.host in {"127.0.0.1", "localhost"}
+            and (url.port or (443 if url.scheme == "https" else 80)) == 11434
+            and url.path.rstrip("/") == "/v1/chat/completions"
         )
     except Exception:
         return False
 
 
-def _native_url(url: object) -> str:
-    parts = urlsplit(str(url))
-    return urlunsplit((parts.scheme, parts.netloc, "/api/chat", "", ""))
+def _native_url(url: httpx.URL) -> httpx.URL:
+    return url.copy_with(path="/api/chat", query=None, fragment=None)
 
 
 def _extract_payload(kwargs: dict) -> dict | None:
@@ -65,7 +77,6 @@ def _native_payload(openai_payload: dict) -> dict:
         "stream": False,
     }
 
-    # Preserve structured-output intent where possible.
     response_format = openai_payload.get("response_format")
     if isinstance(response_format, dict):
         fmt_type = response_format.get("type")
@@ -77,13 +88,12 @@ def _native_payload(openai_payload: dict) -> dict:
                 native["format"] = schema
 
     options: dict = {}
-    mapping = {
+    for source, target in {
         "temperature": "temperature",
         "top_p": "top_p",
         "seed": "seed",
         "max_tokens": "num_predict",
-    }
-    for source, target in mapping.items():
+    }.items():
         if source in openai_payload and openai_payload[source] is not None:
             options[target] = openai_payload[source]
     if options:
@@ -92,7 +102,7 @@ def _native_payload(openai_payload: dict) -> dict:
     return native
 
 
-def _openai_response(native_response: httpx.Response, request_url: object, model_hint: object = None) -> httpx.Response:
+def _openai_response(native_response: httpx.Response, model_hint: object = None) -> httpx.Response:
     data = native_response.json()
     message = data.get("message") if isinstance(data, dict) else None
     if not isinstance(message, dict):
@@ -101,8 +111,6 @@ def _openai_response(native_response: httpx.Response, request_url: object, model
     if not isinstance(content, str):
         content = str(content)
 
-    # Keep native thinking available only as an optional public metadata field;
-    # the runtime still controls what it persists/displays.
     translated_message = {"role": message.get("role") or "assistant", "content": content}
     if isinstance(message.get("thinking"), str) and message.get("thinking"):
         translated_message["thinking"] = message["thinking"]
@@ -115,13 +123,11 @@ def _openai_response(native_response: httpx.Response, request_url: object, model
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": translated_message,
-                "finish_reason": "stop" if (not isinstance(data, dict) or data.get("done", True)) else None,
-            }
-        ],
+        "choices": [{
+            "index": 0,
+            "message": translated_message,
+            "finish_reason": "stop",
+        }],
         "usage": {
             "prompt_tokens": int(prompt_eval_count or 0),
             "completion_tokens": int(eval_count or 0),
@@ -137,8 +143,9 @@ def _openai_response(native_response: httpx.Response, request_url: object, model
 
 
 async def _async_request(self, method, url, *args, **kwargs):
+    resolved = _resolved_url(self, url)
     response = await _ORIG_ASYNC_REQUEST(self, method, url, *args, **kwargs)
-    if response.status_code != 404 or not _is_openai_ollama_url(url):
+    if response.status_code != 404 or not _is_openai_ollama_url(resolved):
         return response
 
     payload = _extract_payload(kwargs)
@@ -148,18 +155,19 @@ async def _async_request(self, method, url, *args, **kwargs):
     retry_kwargs = dict(kwargs)
     retry_kwargs.pop("content", None)
     retry_kwargs["json"] = _native_payload(payload)
-    native = await _ORIG_ASYNC_REQUEST(self, method, _native_url(url), *args, **retry_kwargs)
+    native = await _ORIG_ASYNC_REQUEST(self, method, _native_url(resolved), *args, **retry_kwargs)
     if native.status_code >= 400:
         return native
     try:
-        return _openai_response(native, url, payload.get("model"))
+        return _openai_response(native, payload.get("model"))
     except Exception:
         return native
 
 
 def _sync_request(self, method, url, *args, **kwargs):
+    resolved = _resolved_url(self, url)
     response = _ORIG_SYNC_REQUEST(self, method, url, *args, **kwargs)
-    if response.status_code != 404 or not _is_openai_ollama_url(url):
+    if response.status_code != 404 or not _is_openai_ollama_url(resolved):
         return response
 
     payload = _extract_payload(kwargs)
@@ -169,11 +177,11 @@ def _sync_request(self, method, url, *args, **kwargs):
     retry_kwargs = dict(kwargs)
     retry_kwargs.pop("content", None)
     retry_kwargs["json"] = _native_payload(payload)
-    native = _ORIG_SYNC_REQUEST(self, method, _native_url(url), *args, **retry_kwargs)
+    native = _ORIG_SYNC_REQUEST(self, method, _native_url(resolved), *args, **retry_kwargs)
     if native.status_code >= 400:
         return native
     try:
-        return _openai_response(native, url, payload.get("model"))
+        return _openai_response(native, payload.get("model"))
     except Exception:
         return native
 
@@ -185,7 +193,7 @@ def install() -> None:
     httpx.AsyncClient.request = _async_request
     httpx.Client.request = _sync_request
     _INSTALLED = True
-    print("Local Company: Ollama /api/chat fallback enabled")
+    print("Local Company: Ollama native /api/chat fallback enabled")
 
 
 install()
