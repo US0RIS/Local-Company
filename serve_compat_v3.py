@@ -1,266 +1,334 @@
 #!/usr/bin/env python3
-"""Strict compatibility server for the streamlined Local Company UI.
+"""Local Company compatibility server v3.
 
-The original FastAPI backend remains authoritative.  This outer layer adapts
-only UI message requests.  Unlike the older adapter, it builds a clean JSON body
-containing only fields accepted by the original Pydantic/FastAPI body schema, so
-models configured with extra='forbid' do not reject Grok-shell metadata.
+An outer FastAPI router intercepts UI message sends *before* the original
+backend's Pydantic validation, converts the Grok-style payload to the exact body
+shape of the real message endpoint, and forwards it internally to the original
+app. All other routes fall through unchanged.
 """
 from __future__ import annotations
 
 import enum
-import json
 import os
 from typing import Any, get_args, get_origin
 
+import httpx
+import ollama_compat  # noqa: F401 - install native Ollama fallback before core import
 import serve_compat
-import serve_compat_v2
-from starlette.requests import Request
-from starlette.responses import JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.routing import APIRoute
+from starlette.responses import JSONResponse, Response
 
-app = serve_compat_v2.app
+core_app = serve_compat.app
+app = FastAPI(title="Local Company compatibility router", docs_url=None, redoc_url=None)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-
-def _field_alias(field: Any, fallback: str) -> str:
-    alias = getattr(field, "alias", None)
-    if isinstance(alias, str) and alias:
-        return alias
-    serialization_alias = getattr(field, "serialization_alias", None)
-    if isinstance(serialization_alias, str) and serialization_alias:
-        return serialization_alias
-    return fallback
-
-
-def _schema_fields() -> dict[str, dict[str, Any]]:
-    """Return the actual accepted body fields, including scalar body params."""
-    route = serve_compat._agent_message_route()
-    if route is None:
-        return {}
-
-    result: dict[str, dict[str, Any]] = {}
-    model_fields = serve_compat._body_model_fields(route)
-    if model_fields:
-        for name, field in model_fields.items():
-            result[name] = {
-                "field": field,
-                "alias": _field_alias(field, name),
-                "required": serve_compat._field_required(field),
-                "annotation": serve_compat._field_annotation(field),
-            }
-        return result
-
-    # FastAPI also supports endpoints declared with scalar/body parameters rather
-    # than a user-defined Pydantic model.  In that case there may be no model
-    # fields to introspect, but dependant.body_params is authoritative.
-    for param in getattr(route.dependant, "body_params", []) or []:
-        name = getattr(param, "name", None) or getattr(param, "alias", None)
-        if not name:
-            continue
-        alias = getattr(param, "alias", None) or name
-        required = bool(getattr(param, "required", False))
-        annotation = getattr(param, "type_", None)
-        if annotation is None:
-            annotation = getattr(getattr(param, "field_info", None), "annotation", None)
-        result[str(name)] = {
-            "field": param,
-            "alias": str(alias),
-            "required": required,
-            "annotation": annotation,
-        }
-    return result
+_TEXT_KEYS = ("content", "text", "message", "message_text", "prompt", "body", "input", "value")
+_AGENT_KEYS = (
+    "agent_id", "agentId", "employee_id", "employeeId", "recipient_id", "recipientId",
+    "target_agent_id", "targetAgentId", "to_agent_id", "toAgentId", "recipient", "target", "to",
+)
+_HUMAN_KEYS = ("sender", "sender_type", "author", "author_type", "role", "source")
 
 
-def _is_string_annotation(annotation: Any) -> bool:
-    if annotation is str:
-        return True
-    origin = get_origin(annotation)
-    if origin is not None:
-        return any(_is_string_annotation(arg) for arg in get_args(annotation))
-    return False
+def _real_message_route() -> APIRoute | None:
+    for route in core_app.routes:
+        if isinstance(route, APIRoute) and route.path == "/api/agents/{agent_id}/messages" and "POST" in (route.methods or set()):
+            return route
+    return None
 
 
-def _human_value(annotation: Any) -> Any:
-    value = serve_compat._enum_or_literal_human_value(annotation)
+def _extract_text(payload: Any) -> str | None:
+    if isinstance(payload, str):
+        return payload.strip() or None
+    if not isinstance(payload, dict):
+        return None
+    for key in _TEXT_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+        if isinstance(value, dict):
+            nested = _extract_text(value)
+            if nested:
+                return nested
+    return None
+
+
+def _string_id(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        for key in ("id", "agent_id", "agentId", "employee_id", "employeeId", "value"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _extract_agent_id(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in _AGENT_KEYS:
+        candidate = _string_id(payload.get(key))
+        if candidate:
+            return candidate
+    for key in ("message", "request", "destination", "context", "meta"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            candidate = _extract_agent_id(nested)
+            if candidate:
+                return candidate
+    return None
+
+
+def _required(field: Any) -> bool:
+    checker = getattr(field, "is_required", None)
+    if callable(checker):
+        try:
+            return bool(checker())
+        except Exception:
+            pass
+    value = getattr(field, "required", None)
+    return bool(value) if value is not None else False
+
+
+def _annotation(field: Any) -> Any:
+    value = getattr(field, "annotation", None)
     if value is not None:
         return value
-    if _is_string_annotation(annotation):
+    return getattr(field, "outer_type_", None) or getattr(field, "type_", None)
+
+
+def _fields(model: Any) -> dict[str, Any]:
+    if model is None:
+        return {}
+    value = getattr(model, "model_fields", None)
+    if isinstance(value, dict) and value:
+        return value
+    value = getattr(model, "__fields__", None)
+    return value if isinstance(value, dict) else {}
+
+
+def _alias(field: Any, name: str) -> str:
+    for attr in ("validation_alias", "alias"):
+        value = getattr(field, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return name
+
+
+def _is_type(annotation: Any, target: type) -> bool:
+    if annotation is target:
+        return True
+    origin = get_origin(annotation)
+    if origin is None:
+        return False
+    return any(_is_type(arg, target) for arg in get_args(annotation))
+
+
+def _human_value(annotation: Any) -> Any | None:
+    if _is_type(annotation, str):
         return "human"
+    origin = get_origin(annotation)
+    if origin is not None:
+        for wanted in ("human", "user", "owner"):
+            for value in get_args(annotation):
+                if str(value).lower() == wanted:
+                    return value
+        for value in get_args(annotation):
+            found = _human_value(value)
+            if found is not None:
+                return found
+        return None
     try:
         if isinstance(annotation, type) and issubclass(annotation, enum.Enum):
-            members = list(annotation)
-            if members:
-                return members[0].value
+            for wanted in ("human", "user", "owner"):
+                for member in annotation:
+                    if member.name.lower() == wanted or str(member.value).lower() == wanted:
+                        return member.value
     except Exception:
         pass
     return None
 
 
-def _candidate_value(payload: dict[str, Any], name: str, alias: str) -> tuple[bool, Any]:
-    for key in (alias, name):
-        if key in payload:
-            return True, payload[key]
-    return False, None
+def _descriptor() -> dict[str, Any]:
+    route = _real_message_route()
+    if route is None:
+        return {"route": None, "kind": "missing", "fields": {}, "body_param": None, "annotation": None}
 
+    body_params = list(getattr(route.dependant, "body_params", []) or [])
+    candidates: list[Any] = []
+    if route.body_field is not None:
+        candidates.extend([
+            getattr(route.body_field, "type_", None),
+            getattr(getattr(route.body_field, "field_info", None), "annotation", None),
+        ])
+    for param in body_params:
+        candidates.extend([
+            getattr(param, "type_", None),
+            getattr(param, "annotation", None),
+            getattr(getattr(param, "field_info", None), "annotation", None),
+        ])
 
-def _clean_payload(payload: dict[str, Any], agent_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-    fields = _schema_fields()
-    text = serve_compat._extract_text(payload)
-    clean: dict[str, Any] = {}
+    for candidate in candidates:
+        model_fields = _fields(candidate)
+        if model_fields:
+            return {"route": route, "kind": "model", "fields": model_fields, "body_param": None, "annotation": candidate}
 
-    if not fields:
-        # Do not guess silently.  Returning diagnostics is better than another
-        # opaque FastAPI 422.
-        return {}, {
-            "ok": False,
-            "error": "Could not introspect the original message body schema",
-            "received_keys": list(payload.keys()),
+    if len(body_params) == 1:
+        param = body_params[0]
+        annotation = getattr(param, "type_", None) or getattr(param, "annotation", None) or getattr(getattr(param, "field_info", None), "annotation", None)
+        return {
+            "route": route,
+            "kind": "scalar",
+            "fields": {},
+            "body_param": getattr(param, "name", None),
+            "annotation": annotation,
         }
 
-    for name, meta in fields.items():
-        alias = str(meta["alias"])
-        present, value = _candidate_value(payload, name, alias)
-        if present:
-            clean[alias] = value
-            continue
-
-        lower_name = name.lower()
-        lower_alias = alias.lower()
-        key_tokens = {lower_name, lower_alias}
-
-        if text is not None and any(token in serve_compat._TEXT_KEYS for token in key_tokens):
-            clean[alias] = text
-            continue
-        if any(token in serve_compat._AGENT_KEYS for token in key_tokens):
-            clean[alias] = agent_id
-            continue
-        if any(token in serve_compat._HUMAN_KEYS for token in key_tokens):
-            human = _human_value(meta["annotation"])
-            if human is not None:
-                clean[alias] = human
-                continue
-
-    required = [name for name, meta in fields.items() if meta["required"]]
-    missing = [
-        name
-        for name in required
-        if str(fields[name]["alias"]) not in clean
-    ]
-
-    # Common FastAPI shape: exactly one required body field whose name is not one
-    # of our known text tokens.  If the UI supplied text, that field is the DM.
-    if text is not None and len(missing) == 1:
-        name = missing[0]
-        clean[str(fields[name]["alias"])] = text
-        missing = []
-
-    return clean, {
-        "ok": not missing,
-        "schema_fields": {
-            name: {
-                "alias": meta["alias"],
-                "required": meta["required"],
-                "annotation": str(meta["annotation"]),
-            }
-            for name, meta in fields.items()
-        },
-        "required_fields": required,
-        "missing_required": missing,
-        "received_keys": list(payload.keys()),
-        "sent_keys": list(clean.keys()),
-    }
+    return {"route": route, "kind": "unknown", "fields": {}, "body_param": None, "annotation": None}
 
 
-def _replace_body(request: Request, body: bytes) -> None:
-    request._body = body
-    sent = False
+def _normalize(payload: Any, agent_id: str) -> tuple[Any, dict[str, Any]]:
+    desc = _descriptor()
+    text = _extract_text(payload)
 
-    async def receive():
-        nonlocal sent
-        if sent:
-            return {"type": "http.request", "body": b"", "more_body": False}
-        sent = True
-        return {"type": "http.request", "body": body, "more_body": False}
+    if desc["kind"] == "model":
+        source = payload if isinstance(payload, dict) else {}
+        clean: dict[str, Any] = {}
+        unresolved: list[str] = []
+        agent_tokens = {key.lower() for key in _AGENT_KEYS}
 
-    request._receive = receive
+        for name, field in desc["fields"].items():
+            alias = _alias(field, name)
+            ann = _annotation(field)
+            lower = name.lower()
+            if alias in source:
+                clean[alias] = source[alias]
+            elif name in source:
+                clean[alias] = source[name]
+            elif lower in _TEXT_KEYS and text is not None:
+                clean[alias] = text
+            elif lower in agent_tokens:
+                clean[alias] = agent_id
+            elif lower in _HUMAN_KEYS:
+                value = _human_value(ann)
+                if value is not None:
+                    clean[alias] = value
+            elif _required(field):
+                if text is not None and _is_type(ann, str):
+                    clean[alias] = text
+                elif _is_type(ann, bool):
+                    clean[alias] = False
+                else:
+                    unresolved.append(name)
 
-    # Keep Content-Length consistent for downstream consumers that inspect it.
-    headers = []
-    for key, value in request.scope.get("headers", []):
-        if key.lower() != b"content-length":
-            headers.append((key, value))
-    headers.append((b"content-length", str(len(body)).encode("ascii")))
-    request.scope["headers"] = headers
+        if text is not None and len(unresolved) == 1:
+            name = unresolved[0]
+            clean[_alias(desc["fields"][name], name)] = text
+            unresolved = []
+
+        return clean, {
+            "kind": "model",
+            "fields": list(desc["fields"].keys()),
+            "required": [name for name, field in desc["fields"].items() if _required(field)],
+            "sent_keys": list(clean.keys()),
+            "unresolved_required": unresolved,
+        }
+
+    if desc["kind"] == "scalar":
+        ann = desc["annotation"]
+        param = desc["body_param"]
+        if _is_type(ann, str):
+            return text or "", {"kind": "scalar", "body_param": param, "annotation": "str"}
+        if isinstance(payload, dict) and param and param in payload:
+            return payload[param], {"kind": "scalar", "body_param": param, "annotation": str(ann)}
+        return payload, {"kind": "scalar", "body_param": param, "annotation": str(ann)}
+
+    return payload, {"kind": desc["kind"]}
 
 
-@app.middleware("http")
-async def strict_message_adapter(request: Request, call_next):
-    if request.method.upper() != "POST":
-        return await call_next(request)
-    if "application/json" not in request.headers.get("content-type", "").lower():
-        return await call_next(request)
+async def _forward(agent_id: str, payload: Any) -> Response:
+    normalized, debug = _normalize(payload, agent_id)
+    if debug.get("unresolved_required"):
+        return JSONResponse(status_code=422, content={"detail": "Compatibility router could not satisfy backend message schema", "adapter": debug})
 
-    original_path = request.url.path
-    generic = original_path == "/api/messages"
-    match = serve_compat._AGENT_MESSAGE_RE.match(original_path)
-    if not generic and not match:
-        return await call_next(request)
+    transport = httpx.ASGITransport(app=core_app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://local-company-core") as client:
+        core_response = await client.post(f"/api/agents/{agent_id}/messages", json=normalized)
 
-    raw = await request.body()
+    if core_response.status_code == 422:
+        try:
+            validation = core_response.json()
+        except Exception:
+            validation = core_response.text
+        return JSONResponse(status_code=422, content={"detail": validation, "adapter": debug})
+
+    blocked = {"content-length", "content-encoding", "transfer-encoding", "connection", "content-type"}
+    headers = {k: v for k, v in core_response.headers.items() if k.lower() not in blocked}
+    return Response(
+        content=core_response.content,
+        status_code=core_response.status_code,
+        headers=headers,
+        media_type=core_response.headers.get("content-type", "application/json").split(";", 1)[0],
+    )
+
+
+@app.post("/api/agents/{agent_id}/messages", include_in_schema=False)
+async def send_agent_message(agent_id: str, request: Request):
     try:
-        payload = json.loads(raw.decode("utf-8")) if raw else {}
+        payload = await request.json()
     except Exception:
-        return JSONResponse(status_code=400, content={"detail": "Message body must be valid JSON"})
-    if not isinstance(payload, dict):
-        return JSONResponse(status_code=422, content={"detail": "Message body must be a JSON object"})
-
-    if generic:
-        agent_id = serve_compat_v2._extract_agent_id(payload)
-        if not agent_id:
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "detail": "Message destination missing",
-                    "received_keys": list(payload.keys()),
-                    "accepted_destination_keys": list(serve_compat_v2._AGENT_ID_KEYS),
-                },
-            )
-        rewritten = f"/api/agents/{agent_id}/messages"
-        request.scope["path"] = rewritten
-        request.scope["raw_path"] = rewritten.encode("ascii", "ignore")
-    else:
-        agent_id = match.group(1)
-
-    clean, debug = _clean_payload(payload, agent_id)
-    if not debug.get("ok"):
-        return JSONResponse(status_code=422, content={"detail": "Message adapter could not satisfy backend schema", **debug})
-
-    new_body = json.dumps(clean, ensure_ascii=False).encode("utf-8")
-    _replace_body(request, new_body)
-    request.state.local_company_strict_message_adapter = debug
-    return await call_next(request)
+        payload = (await request.body()).decode("utf-8", "replace")
+    return await _forward(agent_id, payload)
 
 
-@app.get("/api/compat/message-schema-v3", include_in_schema=False)
-def message_schema_v3():
-    fields = _schema_fields()
+@app.post("/api/messages", include_in_schema=False)
+async def send_generic_message(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    agent_id = _extract_agent_id(payload)
+    if not agent_id:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": "Message destination missing",
+                "received_keys": list(payload.keys()) if isinstance(payload, dict) else [],
+                "accepted_destination_keys": list(_AGENT_KEYS),
+            },
+        )
+    return await _forward(agent_id, payload)
+
+
+@app.get("/api/compat/message-schema", include_in_schema=False)
+def message_schema():
+    desc = _descriptor()
     return {
-        "ok": bool(fields),
-        "fields": {
-            name: {
-                "alias": meta["alias"],
-                "required": meta["required"],
-                "annotation": str(meta["annotation"]),
-            }
-            for name, meta in fields.items()
-        },
+        "ok": desc["route"] is not None,
+        "kind": desc["kind"],
+        "body_param": desc["body_param"],
+        "annotation": str(desc["annotation"]),
+        "fields": list(desc["fields"].keys()),
+        "required": [name for name, field in desc["fields"].items() if _required(field)],
+        "ollama_native_fallback": True,
     }
+
+
+# Must be last: unmatched requests continue into the authoritative backend.
+app.mount("/", core_app)
 
 
 def main() -> None:
     import uvicorn
-    import ollama_compat
-
-    ollama_compat.install()
     uvicorn.run(
         app,
         host="127.0.0.1",
