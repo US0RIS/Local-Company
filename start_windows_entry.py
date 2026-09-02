@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Windows entrypoint that preserves the existing launcher but swaps only the live server.
+"""Windows entrypoint that preserves setup/seed and swaps only the live server.
 
 Database seeding and dependency setup still use run_backend.py. When the launcher
-starts the long-running backend via subprocess.Popen, this shim redirects that
-one process to serve_compat.py so the streamlined UI gets its read aliases.
+starts the long-running backend, this shim redirects that one process to
+serve_compat.py so the streamlined UI gets its read aliases.
 """
 from __future__ import annotations
 
@@ -22,20 +22,22 @@ def _compat_popen(args, *pargs, **kwargs):
     rewritten = args
     if isinstance(args, (list, tuple)):
         parts = list(args)
-        for index, value in enumerate(parts):
-            try:
-                normalized = str(Path(str(value)).resolve()).lower()
-            except Exception:
-                normalized = str(value).lower()
-            if normalized == _ORIGINAL_SERVER:
-                parts[index] = _COMPAT_SERVER
-                rewritten = parts
-                break
+        is_seed = any(str(value).lower() == "--seed" for value in parts)
+        if not is_seed:
+            for index, value in enumerate(parts):
+                try:
+                    normalized = str(Path(str(value)).resolve()).lower()
+                except Exception:
+                    normalized = str(value).lower()
+                if normalized == _ORIGINAL_SERVER:
+                    parts[index] = _COMPAT_SERVER
+                    rewritten = parts
+                    break
     return _REAL_POPEN(rewritten, *pargs, **kwargs)
 
 
-# start_windows imports the subprocess module object, so replacing Popen on that
-# module is sufficient. subprocess.run (used for seed/setup) remains unchanged.
+# subprocess.run internally uses Popen too, so the explicit --seed guard above
+# is what keeps database initialization on the original backend.
 start_windows.subprocess.Popen = _compat_popen
 
 
