@@ -4,9 +4,11 @@
 This wraps serve_compat with an outer message-body middleware that:
 - accepts both the real per-agent send route and the streamlined UI's generic
   POST /api/messages fallback;
-- rewrites the generic route to the selected agent's real message endpoint; and
+- rewrites the generic route to the selected agent's real message endpoint;
 - normalizes the JSON body against the original FastAPI/Pydantic schema before
-  validation.
+  validation; and
+- enables an Ollama native /api/chat fallback when /v1/chat/completions is not
+  available on the installed Ollama version.
 
 The original backend remains authoritative for persistence, agent wakeups, model
 work, permissions, and all write behavior.
@@ -17,6 +19,9 @@ import json
 import os
 from typing import Any
 
+# Install this before importing the bootstrapped backend, so any httpx clients
+# created by the runtime inherit the Ollama fallback behavior.
+import ollama_compat  # noqa: F401
 import serve_compat
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -42,7 +47,6 @@ _AGENT_ID_KEYS = (
 
 
 def _string_id(value: Any) -> str | None:
-    """Extract an ID from the common shapes used by UI request payloads."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -63,7 +67,6 @@ def _extract_agent_id(payload: dict[str, Any]) -> str | None:
             if candidate:
                 return candidate
 
-    # Some clients nest destination metadata under a message/request object.
     for container_key in ("message", "request", "destination", "context", "meta"):
         nested = payload.get(container_key)
         if isinstance(nested, dict):
@@ -76,8 +79,6 @@ def _extract_agent_id(payload: dict[str, Any]) -> str | None:
 
 
 def _replace_cached_body(request: Request, body: bytes) -> None:
-    # Starlette caches request.body(). Replacing both _body and _receive ensures
-    # downstream middleware and FastAPI validation see the normalized bytes.
     request._body = body
     sent = False
 
@@ -156,6 +157,7 @@ def compat_send_status():
             name for name, field in fields.items() if serve_compat._field_required(field)
         ],
         "destination_keys_accepted": list(_AGENT_ID_KEYS),
+        "ollama_native_fallback": True,
     }
 
 
