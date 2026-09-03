@@ -10,7 +10,7 @@ import start_windows
 _REAL_POPEN = subprocess.Popen
 _ROOT = Path(__file__).resolve().parent
 _ORIGINAL_SERVER = str((_ROOT / "run_backend.py").resolve()).lower()
-_FIXED_SERVER = str((_ROOT / "serve_fixed.py").resolve())
+_FINAL_SERVER = str((_ROOT / "serve_final.py").resolve())
 
 
 def _compat_popen(args, *pargs, **kwargs):
@@ -25,7 +25,7 @@ def _compat_popen(args, *pargs, **kwargs):
                 except Exception:
                     normalized = str(value).lower()
                 if normalized == _ORIGINAL_SERVER:
-                    parts[index] = _FIXED_SERVER
+                    parts[index] = _FINAL_SERVER
                     rewritten = parts
                     break
     return _REAL_POPEN(rewritten, *pargs, **kwargs)
