@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse, Response
+from starlette.routing import Match
 
 core_app = serve_compat.app
 app = FastAPI(title="Local Company compatibility router", docs_url=None, redoc_url=None)
@@ -37,11 +38,44 @@ _AGENT_KEYS = (
 _HUMAN_KEYS = ("sender", "sender_type", "author", "author_type", "role", "source")
 
 
+def _probe_scope() -> dict[str, Any]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/agents/00000000-0000-0000-0000-000000000000/messages",
+        "raw_path": b"/api/agents/00000000-0000-0000-0000-000000000000/messages",
+        "query_string": b"",
+        "headers": [],
+        "client": ("127.0.0.1", 1),
+        "server": ("127.0.0.1", 8000),
+        "root_path": "",
+        "app": core_app,
+    }
+
+
 def _real_message_route() -> APIRoute | None:
+    """Ask Starlette which core route actually matches the browser's POST URL.
+
+    This intentionally does not assume the path placeholder is named agent_id;
+    older bundles may use employee_id, id, or a broader dynamic route.
+    """
+    scope = _probe_scope()
+    partial: APIRoute | None = None
     for route in core_app.routes:
-        if isinstance(route, APIRoute) and route.path == "/api/agents/{agent_id}/messages" and "POST" in (route.methods or set()):
+        if not isinstance(route, APIRoute):
+            continue
+        try:
+            match, _ = route.matches(scope)
+        except Exception:
+            continue
+        if match == Match.FULL:
             return route
-    return None
+        if match == Match.PARTIAL and partial is None:
+            partial = route
+    return partial
 
 
 def _extract_text(payload: Any) -> str | None:
@@ -309,8 +343,11 @@ def _param_dump(items: list[Any]) -> list[dict[str, Any]]:
 @app.get("/api/compat/message-schema", include_in_schema=False)
 def message_schema():
     desc = _descriptor()
+    route = desc["route"]
     return {
-        "ok": desc["route"] is not None,
+        "ok": route is not None,
+        "matched_path": getattr(route, "path", None),
+        "matched_methods": sorted(getattr(route, "methods", set()) or []),
         "kind": desc["kind"],
         "body_param": desc["body_param"],
         "annotation": str(desc["annotation"]),
@@ -324,7 +361,14 @@ def message_schema():
 def message_debug():
     route = _real_message_route()
     if route is None:
-        return {"ok": False, "error": "route not found"}
+        candidates = []
+        for candidate in core_app.routes:
+            if isinstance(candidate, APIRoute):
+                path = getattr(candidate, "path", "")
+                methods = sorted(candidate.methods or [])
+                if "agent" in path.lower() or "message" in path.lower():
+                    candidates.append({"path": path, "methods": methods, "name": getattr(candidate, "name", None)})
+        return {"ok": False, "error": "route not found", "candidate_routes": candidates}
     endpoint = route.endpoint
     try:
         source = inspect.getsource(endpoint)
