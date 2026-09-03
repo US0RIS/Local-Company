@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Windows entrypoint that preserves setup/seed and swaps only the live server.
-
-Database seeding and dependency setup still use run_backend.py. When the launcher
-starts the long-running backend, this shim redirects that one process to
-serve_compat_v3.py so the streamlined UI gets read aliases, strict message-body
-adaptation, and Ollama endpoint compatibility without changing the underlying
-runtime.
-"""
+"""Windows entrypoint that preserves setup/seed and swaps only the live server."""
 from __future__ import annotations
 
 import subprocess
@@ -17,7 +10,7 @@ import start_windows
 _REAL_POPEN = subprocess.Popen
 _ROOT = Path(__file__).resolve().parent
 _ORIGINAL_SERVER = str((_ROOT / "run_backend.py").resolve()).lower()
-_COMPAT_SERVER = str((_ROOT / "serve_compat_v3.py").resolve())
+_FIXED_SERVER = str((_ROOT / "serve_fixed.py").resolve())
 
 
 def _compat_popen(args, *pargs, **kwargs):
@@ -32,14 +25,12 @@ def _compat_popen(args, *pargs, **kwargs):
                 except Exception:
                     normalized = str(value).lower()
                 if normalized == _ORIGINAL_SERVER:
-                    parts[index] = _COMPAT_SERVER
+                    parts[index] = _FIXED_SERVER
                     rewritten = parts
                     break
     return _REAL_POPEN(rewritten, *pargs, **kwargs)
 
 
-# subprocess.run internally uses Popen too, so the explicit --seed guard above
-# is what keeps database initialization on the original backend.
 start_windows.subprocess.Popen = _compat_popen
 
 
